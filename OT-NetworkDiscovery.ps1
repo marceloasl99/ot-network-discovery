@@ -1,18 +1,17 @@
 #requires -Version 5.1
 <#
 .SYNOPSIS
-    Passive-first IPv4 neighbor discovery and reporting for authorized Windows networks.
+    Discovers IPv4 neighbors on an authorized Windows network.
 .DESCRIPTION
-    Collects the local IPv4 configuration, safely calculates the network range,
-    optionally performs bounded ICMP discovery, refreshes the Windows neighbor cache,
-    and exports TXT, CSV and JSON reports. No administrator privileges are required
-    for the default workflow.
+    Selects an active IPv4 interface, calculates the CIDR range, optionally
+    performs bounded ICMP discovery, reads the Windows neighbor cache, and
+    exports CSV, JSON, summary, and log files.
 .NOTES
     Use only on networks you own or are explicitly authorized to assess.
 #>
 [CmdletBinding()]
 param(
-    [string]$OutputPath = (Join-Path (Get-Location) ("OT_Discovery_{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
+    [string]$OutputPath = (Join-Path -Path (Get-Location) -ChildPath ("OT_Discovery_{0}" -f (Get-Date -Format 'yyyyMMdd_HHmmss'))),
     [ValidateRange(100,5000)][int]$TimeoutMs = 450,
     [ValidateRange(1,128)][int]$ThrottleLimit = 32,
     [ValidateRange(1,4096)][int]$MaxHosts = 1024,
@@ -22,99 +21,388 @@ param(
     [switch]$IncludeLocalAddress,
     [string]$InterfaceAlias
 )
+
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
-$script:Warnings = [System.Collections.Generic.List[string]]::new()
-function Write-Log {
-    param([string]$Message,[ValidateSet('INFO','WARN','ERROR')][string]$Level='INFO')
-    $line = '[{0}] [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'),$Level,$Message
-    Add-Content -LiteralPath $script:LogTxt -Value $line -Encoding UTF8
-    if($Level -eq 'WARN'){ Write-Warning $Message } elseif($Level -eq 'ERROR'){ Write-Error $Message -ErrorAction Continue } else { Write-Host $line }
+$script:LogFile = $null
+$script:Warnings = New-Object 'System.Collections.Generic.List[string]'
+
+function Write-DiscoveryLog {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory=$true)][string]$Message,
+        [ValidateSet('INFO','WARN','ERROR')][string]$Level = 'INFO'
+    )
+    $line = '[{0}] [{1}] {2}' -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $Level, $Message
+    if ($script:LogFile) {
+        try { Add-Content -LiteralPath $script:LogFile -Value $line -Encoding UTF8 } catch { }
+    }
+    switch ($Level) {
+        'WARN'  { Write-Host $line -ForegroundColor Yellow }
+        'ERROR' { Write-Host $line -ForegroundColor Red }
+        default { Write-Host $line }
+    }
 }
+
 function Convert-IPv4ToUInt32 {
-    param([Parameter(Mandatory)][string]$Address)
-    $bytes=[Net.IPAddress]::Parse($Address).GetAddressBytes();[Array]::Reverse($bytes)
-    [BitConverter]::ToUInt32($bytes,0)
+    param([Parameter(Mandatory=$true)][string]$Address)
+    $parsed = $null
+    if (-not [System.Net.IPAddress]::TryParse($Address, [ref]$parsed)) { throw "Invalid IPv4 address: $Address" }
+    if ($parsed.AddressFamily -ne [System.Net.Sockets.AddressFamily]::InterNetwork) { throw "Address is not IPv4: $Address" }
+    $bytes = $parsed.GetAddressBytes()
+    [Array]::Reverse($bytes)
+    return [BitConverter]::ToUInt32($bytes, 0)
 }
+
 function Convert-UInt32ToIPv4 {
-    param([Parameter(Mandatory)][uint32]$Value)
-    $bytes=[BitConverter]::GetBytes($Value);[Array]::Reverse($bytes)
-    ([Net.IPAddress]::new($bytes)).IPAddressToString
+    param([Parameter(Mandatory=$true)][uint32]$Value)
+    $bytes = [BitConverter]::GetBytes($Value)
+    [Array]::Reverse($bytes)
+    return (New-Object System.Net.IPAddress -ArgumentList (, $bytes)).IPAddressToString
 }
+
 function Get-SubnetInfo {
-    param([string]$Address,[ValidateRange(0,32)][int]$PrefixLength)
-    $ipValue=Convert-IPv4ToUInt32 $Address
-    $maskValue=if($PrefixLength -eq 0){[uint32]0}else{[uint32]([uint64]0xFFFFFFFF -shl (32-$PrefixLength))}
-    $network=[uint32]($ipValue -band $maskValue);$broadcast=[uint32]($network -bor ([uint32]0xFFFFFFFF -bxor $maskValue))
-    $usable=[math]::Max(0,([uint64]$broadcast-[uint64]$network-1))
-    [pscustomobject]@{NetworkAddress=Convert-UInt32ToIPv4 $network;BroadcastAddress=Convert-UInt32ToIPv4 $broadcast;PrefixLength=$PrefixLength;NetworkValue=$network;BroadcastValue=$broadcast;UsableHostCount=$usable}
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Address,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(0, 32)]
+        [int]$PrefixLength
+    )
+
+    $ipValue = Convert-IPv4ToUInt32 -Address $Address
+    
+
+    # Não utilizar 0xFFFFFFFF no Windows PowerShell 5.1.
+    # O PowerShell pode interpretar o literal hexadecimal como Int32 -1.
+    $allBits = [uint64]4294967295
+
+    if ($PrefixLength -eq 0) {
+        $maskValue = [uint64]0
+    }
+    else {
+        $hostBits = 32 - $PrefixLength
+
+        $maskValue = ($allBits -shl $hostBits -band $allBits
+        )
+    }
+
+    $inverseMask = $allBits -bxor $maskValue
+    
+
+    $networkValue = $ipValue -band $maskValue
+    
+
+    $broadcastValue = $networkValue -bor $inverseMask
+    
+
+    if ($PrefixLength -eq 32) {
+        $firstHostValue = $networkValue
+        $lastHostValue = $networkValue
+        $usableHostCount = [uint64]1
+    }
+    elseif ($PrefixLength -eq 31) {
+        # Redes /31 são válidas para enlaces ponto a ponto.
+        $firstHostValue = $networkValue
+        $lastHostValue = $broadcastValue
+        $usableHostCount = [uint64]2
+    }
+    else {
+        $firstHostValue = $networkValue + 1
+        $lastHostValue = $broadcastValue - 1
+
+        $usableHostCount = $broadcastValue -
+            $networkValue -
+            1
+        
+    }
+
+    return [pscustomobject][ordered]@{
+        NetworkAddress = Convert-UInt32ToIPv4 `
+            -Value ([uint32]$networkValue)
+
+        BroadcastAddress = Convert-UInt32ToIPv4 `
+            -Value ([uint32]$broadcastValue)
+
+        FirstHostAddress = Convert-UInt32ToIPv4 `
+            -Value ([uint32]$firstHostValue)
+
+        LastHostAddress = Convert-UInt32ToIPv4 `
+            -Value ([uint32]$lastHostValue)
+
+        PrefixLength = $PrefixLength
+
+        MaskAddress = Convert-UInt32ToIPv4 `
+            -Value ([uint32]$maskValue)
+
+        NetworkValue = [uint32]$networkValue
+        BroadcastValue = [uint32]$broadcastValue
+        FirstHostValue = [uint32]$firstHostValue
+        LastHostValue = [uint32]$lastHostValue
+
+        UsableHostCount = $usableHostCount
+    }
 }
+
 function Get-TargetAddresses {
-    param($Subnet,[int]$Limit,[string]$LocalAddress,[switch]$IncludeLocal)
-    $count=[math]::Min([uint64]$Limit,[uint64]$Subnet.UsableHostCount)
-    if($Subnet.UsableHostCount -gt $Limit){$msg="Subnet contains $($Subnet.UsableHostCount) usable hosts; active discovery is limited to $Limit.";$script:Warnings.Add($msg);Write-Log $msg WARN}
-    for($offset=[uint64]1;$offset -le $count;$offset++){
-        $candidate=Convert-UInt32ToIPv4 ([uint32]([uint64]$Subnet.NetworkValue+$offset))
-        if($IncludeLocal -or $candidate -ne $LocalAddress){$candidate}
+    param(
+        [Parameter(Mandatory=$true)]$Subnet,
+        [Parameter(Mandatory=$true)][int]$Limit,
+        [Parameter(Mandatory=$true)][string]$LocalAddress,
+        [switch]$IncludeLocal
+    )
+    if ([uint64]$Subnet.UsableHostCount -eq 0) { return @() }
+    $targetCount = [Math]::Min([uint64]$Limit, [uint64]$Subnet.UsableHostCount)
+    if ([uint64]$Subnet.UsableHostCount -gt [uint64]$Limit) {
+        $message = "Subnet has $($Subnet.UsableHostCount) usable hosts. Active discovery is limited to $Limit targets."
+        $script:Warnings.Add($message)
+        Write-DiscoveryLog -Message $message -Level WARN
     }
+    $list = New-Object 'System.Collections.Generic.List[string]'
+    for ($offset = [uint64]1; $offset -le $targetCount; $offset++) {
+        $value = [uint32]([uint64]$Subnet.NetworkValue + $offset)
+        $candidate = Convert-UInt32ToIPv4 -Value $value
+        if ($IncludeLocal.IsPresent -or $candidate -ne $LocalAddress) { $list.Add($candidate) }
+    }
+    return @($list | ForEach-Object { $_ })
 }
+
 function Invoke-IcmpDiscovery {
-    param([string[]]$Targets,[int]$Timeout,[int]$Throttle)
-    if(-not $Targets){return @()}
-    $pool=[RunspaceFactory]::CreateRunspacePool(1,$Throttle);$pool.Open();$jobs=[Collections.Generic.List[object]]::new()
-    $worker={param($Target,$TimeoutMs)
-        $ping=[Net.NetworkInformation.Ping]::new()
-        try{$reply=$ping.Send($Target,$TimeoutMs);[pscustomobject]@{IPAddress=$Target;Responded=($reply.Status -eq 'Success');LatencyMs=if($reply.Status -eq 'Success'){$reply.RoundtripTime}else{$null};Status=$reply.Status.ToString()}}
-        catch{[pscustomobject]@{IPAddress=$Target;Responded=$false;LatencyMs=$null;Status=$_.Exception.Message}}
-        finally{$ping.Dispose()}
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$Targets,
+
+        [Parameter(Mandatory = $true)]
+        [ValidateRange(100, 5000)]
+        [int]$Timeout,
+
+        [Parameter()]
+        [ValidateRange(1, 128)]
+        [int]$Throttle
+    )
+
+    # O parametro Throttle foi mantido por compatibilidade com a interface
+    # do script. Esta implementacao prioriza compatibilidade e estabilidade
+    # no Windows PowerShell 5.1 e executa as consultas sequencialmente.
+
+    $targetList = @($Targets)
+
+    if ($targetList.Count -eq 0) {
+        return @()
     }
-    foreach($target in $Targets){$ps=[PowerShell]::Create().AddScript($worker).AddArgument($target).AddArgument($Timeout);$ps.RunspacePool=$pool;$jobs.Add([pscustomobject]@{PowerShell=$ps;Handle=$ps.BeginInvoke()})}
-    $results=foreach($job in $jobs){try{$job.PowerShell.EndInvoke($job.Handle)}finally{$job.PowerShell.Dispose()}}
-    $pool.Close();$pool.Dispose();@($results)
+
+    $results = New-Object System.Collections.ArrayList
+
+    $totalTargets = $targetList.Count
+    $currentTarget = 0
+
+    foreach ($target in $targetList) {
+        $currentTarget++
+
+        $percentComplete = ($currentTarget * 100 / $totalTargets)
+
+        Write-Progress `
+            -Activity "OT Network Discovery" `
+            -Status (
+                "Testing {0} ({1} of {2})" -f
+                $target,
+                $currentTarget,
+                $totalTargets
+            ) `
+            -PercentComplete $percentComplete
+
+        $ping = New-Object System.Net.NetworkInformation.Ping
+
+        try {
+            $reply = $ping.Send(
+                [string]$target,
+                [int]$Timeout
+            )
+
+            $responded = (
+                $reply.Status -eq
+                [System.Net.NetworkInformation.IPStatus]::Success
+            )
+
+            $latency = $null
+
+            if ($responded) {
+                $latency = [long]$reply.RoundtripTime
+            }
+
+            $result = [pscustomobject][ordered]@{
+                IPAddress = [string]$target
+                Responded = [bool]$responded
+                LatencyMs = $latency
+                Status    = $reply.Status.ToString()
+            }
+
+            [void]$results.Add($result)
+        }
+        catch {
+            $result = [pscustomobject][ordered]@{
+                IPAddress = [string]$target
+                Responded = $false
+                LatencyMs = $null
+                Status    = $_.Exception.Message
+            }
+
+            [void]$results.Add($result)
+        }
+        finally {
+            if ($null -ne $ping) {
+                $ping.Dispose()
+            }
+        }
+    }
+
+    Write-Progress `
+        -Activity "OT Network Discovery" `
+        -Completed
+
+    return @(
+        $results |
+            ForEach-Object {
+                $_
+            }
+    )
 }
+
 function Get-DnsNameSafe {
-    param([string]$Address)
-    try{([Net.Dns]::GetHostEntry($Address)).HostName}catch{$null}
+    param([Parameter(Mandatory=$true)][string]$Address)
+    try { return ([System.Net.Dns]::GetHostEntry($Address)).HostName } catch { return $null }
 }
+
 try {
     New-Item -ItemType Directory -Path $OutputPath -Force | Out-Null
-    $script:LogTxt=Join-Path $OutputPath 'discovery.log'
-    $csvPath=Join-Path $OutputPath 'devices.csv';$jsonPath=Join-Path $OutputPath 'devices.json';$summaryPath=Join-Path $OutputPath 'summary.txt'
-    Write-Log 'OT network discovery started.'
-    $configs=@(Get-NetIPConfiguration | Where-Object {$_.NetAdapter.Status -eq 'Up' -and $_.IPv4Address})
-    if($InterfaceAlias){$configs=@($configs | Where-Object {$_.InterfaceAlias -eq $InterfaceAlias});if(-not $configs){throw "Active interface '$InterfaceAlias' was not found."}}
-    else{$preferred=@($configs | Where-Object {$_.IPv4DefaultGateway});$configs=if($preferred){$preferred}else{$configs}}
-    if(-not $configs){throw 'No active IPv4 interface was found.'}
-    if($configs.Count -gt 1){$msg="Multiple active interfaces found. Using '$($configs[0].InterfaceAlias)'. Use -InterfaceAlias to select another.";$script:Warnings.Add($msg);Write-Log $msg WARN}
-    $config=$configs[0];$address=@($config.IPv4Address | Where-Object {$_.IPAddress -notlike '169.254.*'})[0]
-    if(-not $address){throw 'The selected interface has no usable non-APIPA IPv4 address.'}
-    $ip=$address.IPAddress;$prefix=[int]$address.PrefixLength;$subnet=Get-SubnetInfo $ip $prefix
-    Write-Log "Interface: $($config.InterfaceAlias); IPv4: $ip/$prefix; Network: $($subnet.NetworkAddress); Broadcast: $($subnet.BroadcastAddress)."
-    $icmp=@()
-    if(-not $SkipActiveDiscovery){
-        $targets=@(Get-TargetAddresses $subnet $MaxHosts $ip -IncludeLocal:$IncludeLocalAddress)
-        Write-Log "Starting bounded ICMP discovery against $($targets.Count) address(es), timeout ${TimeoutMs}ms, throttle $ThrottleLimit."
-        $icmp=@(Invoke-IcmpDiscovery $targets $TimeoutMs $ThrottleLimit)
-        Write-Log "ICMP responses: $(@($icmp | Where-Object Responded).Count)."
-        Start-Sleep -Milliseconds 750
-    } else {Write-Log 'Active ICMP discovery skipped; collecting the existing neighbor cache only.'}
-    $allowedStates=if($IncludeAllNeighborStates){@('Reachable','Stale','Delay','Probe','Permanent','Unreachable','Incomplete')}else{@('Reachable','Stale','Delay','Probe','Permanent')}
-    $neighbors=@(Get-NetNeighbor -InterfaceIndex $config.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {$_.State.ToString() -in $allowedStates -and $_.IPAddress -ne '255.255.255.255' -and $_.IPAddress -ne $subnet.BroadcastAddress})
-    $icmpMap=@{};foreach($r in $icmp){$icmpMap[$r.IPAddress]=$r}
-    $devices=foreach($neighbor in $neighbors){
-        $mac=if($neighbor.LinkLayerAddress -and $neighbor.LinkLayerAddress -ne '00-00-00-00-00-00'){$neighbor.LinkLayerAddress}else{$null}
-        $result=$icmpMap[$neighbor.IPAddress]
-        [pscustomobject][ordered]@{DiscoveredAt=(Get-Date).ToString('o');InterfaceAlias=$config.InterfaceAlias;InterfaceIndex=$config.InterfaceIndex;IPAddress=$neighbor.IPAddress;MacAddress=$mac;NeighborState=$neighbor.State.ToString();IcmpResponded=if($result){[bool]$result.Responded}else{$false};LatencyMs=if($result){$result.LatencyMs}else{$null};DnsName=if($ResolveDns){Get-DnsNameSafe $neighbor.IPAddress}else{$null};IsLocalAddress=($neighbor.IPAddress -eq $ip);Network="$($subnet.NetworkAddress)/$prefix"}
+    $script:LogFile = Join-Path $OutputPath 'discovery.log'
+    $csvPath = Join-Path $OutputPath 'devices.csv'
+    $jsonPath = Join-Path $OutputPath 'devices.json'
+    $summaryPath = Join-Path $OutputPath 'summary.txt'
+    Write-DiscoveryLog -Message 'OT network discovery started.'
+
+    $configs = @(Get-NetIPConfiguration -ErrorAction Stop | Where-Object {
+        $null -ne $_.NetAdapter -and $_.NetAdapter.Status -eq 'Up' -and @($_.IPv4Address).Count -gt 0
+    })
+    if ($InterfaceAlias) {
+        $configs = @($configs | Where-Object { $_.InterfaceAlias -eq $InterfaceAlias })
+        if (@($configs).Count -eq 0) { throw "Active interface '$InterfaceAlias' was not found." }
+    } else {
+        $preferred = @($configs | Where-Object { $null -ne $_.IPv4DefaultGateway })
+        if (@($preferred).Count -gt 0) { $configs = @($preferred) } else { $configs = @($configs) }
     }
-    $devices=@($devices | Sort-Object {[version]$_.IPAddress} -Unique)
-    $devices | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
-    $devices | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
-    $summary=@("OT Network Discovery Summary","Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')","Computer: $env:COMPUTERNAME","User: $env:USERNAME","PowerShell: $($PSVersionTable.PSVersion)","Interface: $($config.InterfaceAlias) (index $($config.InterfaceIndex))","Local IPv4: $ip/$prefix","Network: $($subnet.NetworkAddress)/$prefix","Broadcast: $($subnet.BroadcastAddress)","Active discovery: $(-not $SkipActiveDiscovery)","ICMP targets: $($icmp.Count)","ICMP responses: $(@($icmp | Where-Object Responded).Count)","Neighbor records exported: $($devices.Count)","Warnings: $($script:Warnings.Count)","","Important: absence of an ICMP response does not mean a device is offline; many OT devices block ICMP.")
+    if (@($configs).Count -eq 0) { throw 'No active IPv4 interface was found.' }
+    if (@($configs).Count -gt 1) {
+        $message = "Multiple active interfaces found. Using '$(@($configs)[0].InterfaceAlias)'. Use -InterfaceAlias to select another."
+        $script:Warnings.Add($message)
+        Write-DiscoveryLog -Message $message -Level WARN
+    }
+    $config = @($configs)[0]
+    $addresses = @($config.IPv4Address | Where-Object { $_.IPAddress -and $_.IPAddress -notlike '169.254.*' })
+    if (@($addresses).Count -eq 0) { throw "Interface '$($config.InterfaceAlias)' has no usable IPv4 address." }
+    $selected = @($addresses)[0]
+    $localIp = [string]$selected.IPAddress
+    $prefix = [int]$selected.PrefixLength
+    $subnet = Get-SubnetInfo -Address $localIp -PrefixLength $prefix
+    Write-DiscoveryLog -Message "Interface: $($config.InterfaceAlias); IPv4: $localIp/$prefix; network: $($subnet.NetworkAddress)/$prefix; broadcast: $($subnet.BroadcastAddress)."
+
+    $icmpResults = @()
+    if (-not $SkipActiveDiscovery.IsPresent) {
+        $targets = @(Get-TargetAddresses -Subnet $subnet -Limit $MaxHosts -LocalAddress $localIp -IncludeLocal:$IncludeLocalAddress)
+        Write-DiscoveryLog -Message "Starting bounded ICMP discovery against $(@($targets).Count) address(es); timeout ${TimeoutMs}ms; throttle $ThrottleLimit."
+        $icmpResults = @(Invoke-IcmpDiscovery -Targets $targets -Timeout $TimeoutMs -Throttle $ThrottleLimit)
+        $responseCount = @($icmpResults | Where-Object { $_.Responded -eq $true }).Count
+        Write-DiscoveryLog -Message "ICMP responses: $responseCount."
+        Start-Sleep -Milliseconds 750
+    } else {
+        Write-DiscoveryLog -Message 'Active ICMP discovery skipped; collecting the existing neighbor cache only.'
+    }
+
+    if ($IncludeAllNeighborStates.IsPresent) {
+        $allowedStates = @('Reachable','Stale','Delay','Probe','Permanent','Unreachable','Incomplete')
+    } else {
+        $allowedStates = @('Reachable','Stale','Delay','Probe','Permanent')
+    }
+    $neighbors = @(Get-NetNeighbor -InterfaceIndex $config.InterfaceIndex -AddressFamily IPv4 -ErrorAction SilentlyContinue | Where-Object {
+        $_.IPAddress -and $_.State.ToString() -in $allowedStates -and $_.IPAddress -notin @('0.0.0.0','255.255.255.255',$subnet.BroadcastAddress)
+    })
+    Write-DiscoveryLog -Message "Neighbor-cache entries selected: $(@($neighbors).Count)."
+
+    $icmpMap = @{}
+    foreach ($result in @($icmpResults)) { if ($result -and $result.IPAddress) { $icmpMap[[string]$result.IPAddress] = $result } }
+    $devices = @(
+        foreach ($neighbor in @($neighbors)) {
+            $result = if ($icmpMap.ContainsKey([string]$neighbor.IPAddress)) { $icmpMap[[string]$neighbor.IPAddress] } else { $null }
+            $mac = if ($neighbor.LinkLayerAddress -and $neighbor.LinkLayerAddress -notin @('00-00-00-00-00-00','00:00:00:00:00:00')) { $neighbor.LinkLayerAddress } else { $null }
+            [pscustomobject][ordered]@{
+                DiscoveredAt = (Get-Date).ToString('o')
+                InterfaceAlias = $config.InterfaceAlias
+                InterfaceIndex = $config.InterfaceIndex
+                IPAddress = [string]$neighbor.IPAddress
+                MacAddress = $mac
+                NeighborState = $neighbor.State.ToString()
+                IcmpResponded = if ($result) { [bool]$result.Responded } else { $false }
+                LatencyMs = if ($result) { $result.LatencyMs } else { $null }
+                DnsName = if ($ResolveDns.IsPresent) { Get-DnsNameSafe -Address ([string]$neighbor.IPAddress) } else { $null }
+                IsLocalAddress = ([string]$neighbor.IPAddress -eq $localIp)
+                Network = "$($subnet.NetworkAddress)/$prefix"
+            }
+        }
+    )
+    $devices = @($devices | Sort-Object @{Expression={Convert-IPv4ToUInt32 -Address $_.IPAddress}} -Unique)
+
+    if (@($devices).Count -gt 0) {
+        $devices | Export-Csv -LiteralPath $csvPath -NoTypeInformation -Encoding UTF8
+        $devices | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+    } else {
+        'DiscoveredAt,InterfaceAlias,InterfaceIndex,IPAddress,MacAddress,NeighborState,IcmpResponded,LatencyMs,DnsName,IsLocalAddress,Network' | Set-Content -LiteralPath $csvPath -Encoding UTF8
+        '[]' | Set-Content -LiteralPath $jsonPath -Encoding UTF8
+    }
+
+    $responseCount = @($icmpResults | Where-Object { $_.Responded -eq $true }).Count
+    $summary = @(
+        'OT Network Discovery Summary'
+        '============================'
+        ''
+        "Generated: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss zzz')"
+        "Computer: $env:COMPUTERNAME"
+        "User: $env:USERNAME"
+        "PowerShell: $($PSVersionTable.PSVersion)"
+        "Interface: $($config.InterfaceAlias)"
+        "Interface index: $($config.InterfaceIndex)"
+        "Local IPv4: $localIp/$prefix"
+        "Network: $($subnet.NetworkAddress)/$prefix"
+        "Broadcast: $($subnet.BroadcastAddress)"
+        "Usable hosts: $($subnet.UsableHostCount)"
+        "Active discovery: $(-not $SkipActiveDiscovery.IsPresent)"
+        "ICMP targets: $(@($icmpResults).Count)"
+        "ICMP responses: $responseCount"
+        "Neighbor records exported: $(@($devices).Count)"
+        "Warnings: $($script:Warnings.Count)"
+        ''
+        'Note: absence of an ICMP response does not prove that a device is offline.'
+    )
     $summary | Set-Content -LiteralPath $summaryPath -Encoding UTF8
-    Write-Log "Exported $($devices.Count) neighbor record(s)."
-    Write-Log "Reports: $OutputPath"
-    [pscustomobject]@{OutputPath=(Resolve-Path $OutputPath).Path;Interface=$config.InterfaceAlias;LocalAddress="$ip/$prefix";Network="$($subnet.NetworkAddress)/$prefix";Devices=$devices.Count;IcmpResponses=@($icmp | Where-Object Responded).Count;Warnings=$script:Warnings.Count}
+    Write-DiscoveryLog -Message "Exported $(@($devices).Count) neighbor record(s)."
+    Write-DiscoveryLog -Message "Reports created in: $OutputPath"
+
+    [pscustomobject][ordered]@{
+        OutputPath = (Resolve-Path $OutputPath).Path
+        Interface = $config.InterfaceAlias
+        LocalAddress = "$localIp/$prefix"
+        Network = "$($subnet.NetworkAddress)/$prefix"
+        Devices = @($devices).Count
+        IcmpResponses = $responseCount
+        Warnings = $script:Warnings.Count
+    }
 } catch {
-    if($script:LogTxt){Write-Log $_.Exception.Message ERROR}else{Write-Error $_.Exception.Message}
+    Write-DiscoveryLog -Message $_.Exception.Message -Level ERROR
     exit 1
 }
+
+
+
+
