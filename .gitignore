@@ -1,0 +1,12 @@
+OT_Discovery_*/
+discovery.log
+devices.csv
+devices.json
+summary.txt
+*.zip
+*.bak
+*.tmp
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
